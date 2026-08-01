@@ -23,7 +23,8 @@ use komodo_client::{
 };
 use mogh_resolver::Resolve;
 use periphery_client::api::{
-  compose::ComposeExecution, swarm::RemoveSwarmStacks,
+  compose::{ComposeExecution, DeleteStackFiles},
+  swarm::RemoveSwarmStacks,
 };
 
 use crate::{
@@ -38,6 +39,7 @@ use crate::{
     swarm::swarm_request,
   },
   monitor::{refresh_server_cache, refresh_swarm_cache},
+  periphery::PeripheryClient,
   state::{
     action_states, all_resources_cache, db_client,
     server_status_cache, stack_status_cache,
@@ -361,14 +363,13 @@ impl super::KomodoResource for Stack {
     stack: &Resource<Self::Config, Self::Info>,
     update: &mut Update,
   ) -> anyhow::Result<()> {
-    // If it is Up, it should be taken down
+    // If it is Up, it should be taken down before the files are removed.
     let state = get_stack_state(stack)
       .await
       .context("failed to get stack state")?;
-    if matches!(state, StackState::Down | StackState::Unknown) {
-      return Ok(());
-    }
-    // stack needs to be destroyed
+    let needs_destroy =
+      !matches!(state, StackState::Down | StackState::Unknown);
+
     let swarm_or_server = match get_swarm_or_server(
       &stack.config.swarm_id,
       &stack.config.server_id,
@@ -390,35 +391,89 @@ impl super::KomodoResource for Stack {
       }
     };
 
+    // Stacks using a linked Repo keep their files under the `repo_dir`,
+    // which is owned by the Repo resource, so they are left in place.
+    let delete_files = if stack.config.linked_repo.is_empty() {
+      true
+    } else {
+      update.push_simple_log(
+        "Delete Stack files",
+        "Skipping file delete, the files on the host belong to the linked Repo.",
+      );
+      false
+    };
+
     match swarm_or_server {
       SwarmOrServer::None => {}
       SwarmOrServer::Swarm(swarm) => {
-        match swarm_request(
-          &swarm.config.server_ids,
-          RemoveSwarmStacks {
-            stacks: vec![stack.project_name(false)],
-            detach: true,
-          },
-        )
-        .await
-        {
-          Ok(log) => update.logs.push(log),
-          Err(e) => update.push_simple_log(
-            "Failed to destroy stack",
-            format_serror(
-              &e.context(
-                "Failed to destroy Stack on Swarm before delete",
-              )
-              .into(),
+        if needs_destroy {
+          match swarm_request(
+            &swarm.config.server_ids,
+            RemoveSwarmStacks {
+              stacks: vec![stack.project_name(false)],
+              detach: true,
+            },
+          )
+          .await
+          {
+            Ok(log) => update.logs.push(log),
+            Err(e) => update.push_simple_log(
+              "Failed to destroy stack",
+              format_serror(
+                &e.context(
+                  "Failed to destroy Stack on Swarm before delete",
+                )
+                .into(),
+              ),
             ),
-          ),
+          }
+        }
+
+        if delete_files {
+          // Any of the managers could have written the files,
+          // so all of them are cleaned up.
+          for server_id in &swarm.config.server_ids {
+            let server = match super::get::<Server>(server_id).await {
+              Ok(server) => server,
+              Err(e) => {
+                update.push_error_log(
+                  "Delete Stack files",
+                  format_serror(
+                    &e.context(format!(
+                      "Failed to retrieve Swarm Server {server_id} from database"
+                    ))
+                    .into(),
+                  ),
+                );
+                continue;
+              }
+            };
+            if !server.config.enabled {
+              continue;
+            }
+            match periphery_client(&server).await {
+              Ok(periphery) => {
+                delete_stack_files(stack, &periphery, update).await
+              }
+              Err(e) => update.push_error_log(
+                "Delete Stack files",
+                format_serror(
+                  &e.context(format!(
+                    "Failed to get periphery client for Server {}",
+                    server.name
+                  ))
+                  .into(),
+                ),
+              ),
+            }
+          }
         }
       }
       SwarmOrServer::Server(server) => {
         if !server.config.enabled {
           update.push_simple_log(
             "Destroy Stack",
-            "Skipping stack destroy, Server is disabled.",
+            "Skipping stack destroy and file delete, Server is disabled.",
           );
           return Ok(());
         }
@@ -438,24 +493,30 @@ impl super::KomodoResource for Stack {
           }
         };
 
-        match periphery
-          .request(ComposeExecution {
-            project: stack.project_name(false),
-            command: String::from("down --remove-orphans"),
-          })
-          .await
-        {
-          Ok(log) => update.logs.push(log),
-          Err(e) => update.push_simple_log(
-            "Failed to destroy stack",
-            format_serror(
-              &e.context(
-                "failed to destroy stack on periphery server before delete",
-              )
-              .into(),
+        if needs_destroy {
+          match periphery
+            .request(ComposeExecution {
+              project: stack.project_name(false),
+              command: String::from("down --remove-orphans"),
+            })
+            .await
+          {
+            Ok(log) => update.logs.push(log),
+            Err(e) => update.push_simple_log(
+              "Failed to destroy stack",
+              format_serror(
+                &e.context(
+                  "failed to destroy stack on periphery server before delete",
+                )
+                .into(),
+              ),
             ),
-          ),
-        };
+          };
+        }
+
+        if delete_files {
+          delete_stack_files(stack, &periphery, update).await;
+        }
       }
     }
 
@@ -468,6 +529,32 @@ impl super::KomodoResource for Stack {
   ) -> anyhow::Result<()> {
     stack_status_cache().remove(&resource.id).await;
     Ok(())
+  }
+}
+
+/// Deletes the Stack folder on the host.
+///
+/// Never fatal - a failure is only pushed to the Update logs,
+/// the Stack is deleted from the database either way.
+#[instrument("DeleteStackFiles", skip_all, fields(stack = stack.name))]
+async fn delete_stack_files(
+  stack: &Stack,
+  periphery: &PeripheryClient,
+  update: &mut Update,
+) {
+  match periphery
+    .request(DeleteStackFiles {
+      name: stack.name.clone(),
+    })
+    .await
+  {
+    Ok(log) => update.logs.push(log),
+    Err(e) => update.push_error_log(
+      "Delete Stack files",
+      format_serror(
+        &e.context("Failed to delete Stack files on the host").into(),
+      ),
+    ),
   }
 }
 

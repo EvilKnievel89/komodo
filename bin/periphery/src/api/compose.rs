@@ -1,5 +1,8 @@
 use std::{
-  borrow::Cow, fmt::Write, path::PathBuf, sync::LazyLock,
+  borrow::Cow,
+  fmt::Write,
+  path::{Component, Path, PathBuf},
+  sync::LazyLock,
   time::Duration,
 };
 
@@ -160,6 +163,67 @@ impl Resolve<crate::api::Args> for GetComposeContentsOnHost {
     }
 
     Ok(res)
+  }
+}
+
+//
+
+impl Resolve<crate::api::Args> for DeleteStackFiles {
+  #[instrument(
+    "DeleteStackFiles",
+    skip_all,
+    fields(
+      id = args.id.to_string(),
+      core = args.core,
+      stack = self.name,
+    )
+  )]
+  async fn resolve(
+    self,
+    args: &crate::api::Args,
+  ) -> anyhow::Result<Log> {
+    let DeleteStackFiles { name } = self;
+    let folder = to_path_compatible_name(&name);
+    // Guard against a Stack name which resolves to anything other than a
+    // single folder directly under the stack_dir. Note that `Path::components`
+    // does not resolve '..', so the check has to be on the name itself.
+    let mut components = Path::new(&folder).components();
+    if !matches!(
+      (components.next(), components.next()),
+      (Some(Component::Normal(_)), None)
+    ) {
+      return Err(anyhow!(
+        "Refusing to delete files for Stack '{name}', it does not resolve to a single folder under the stack directory"
+      ));
+    }
+    let path = periphery_config()
+      .stack_dir()
+      .join(&folder)
+      .components()
+      .collect::<PathBuf>();
+    match tokio::fs::remove_dir_all(&path).await {
+      Ok(_) => Ok(Log::simple(
+        "Delete Stack files",
+        format!("Deleted Stack directory at {path:?}"),
+      )),
+      // Nothing was ever written to the host, this is not an error.
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Ok(Log::simple(
+          "Delete Stack files",
+          format!("No Stack directory at {path:?} to delete"),
+        ))
+      }
+      Err(e) => Ok(Log::error(
+        "Delete Stack files",
+        format_serror(
+          &anyhow::Error::from(e)
+            .context(format!(
+              "Failed to delete Stack directory at {path:?}"
+            ))
+            .into(),
+        ),
+      )),
+    }
   }
 }
 

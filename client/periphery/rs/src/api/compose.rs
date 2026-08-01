@@ -85,6 +85,21 @@ pub struct GetComposeLogSearch {
 
 //
 
+/// Delete the Stack folder on the host (`stack_dir` + stack name).
+///
+/// Note. Stacks using a linked Repo keep their files under the
+/// `repo_dir`, which is owned by the Repo resource. Core will not
+/// send this request for those Stacks.
+#[derive(Debug, Clone, Serialize, Deserialize, Resolve)]
+#[response(Log)]
+#[error(anyhow::Error)]
+pub struct DeleteStackFiles {
+  /// The name of the stack
+  pub name: String,
+}
+
+//
+
 /// Write the compose / additional file contents to the file on the host, for stacks using
 /// `files_on_host`.
 #[derive(Debug, Clone, Serialize, Deserialize, Resolve)]

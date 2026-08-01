@@ -78,6 +78,7 @@ pub enum PeripheryRequest {
   GetComposeLogSearch(GetComposeLogSearch),
 
   // Compose (Write)
+  DeleteStackFiles(DeleteStackFiles),
   WriteComposeContentsToHost(WriteComposeContentsToHost),
   WriteCommitComposeContents(WriteCommitComposeContents),
   ComposePull(ComposePull),
